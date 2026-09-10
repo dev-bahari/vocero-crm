@@ -1,5 +1,16 @@
-import { IG_PREFIX } from "@/server/inbox/identity";
-import { ingestInboundMessage } from "@/server/inbox/ingest";
+import { and, eq, sql } from "drizzle-orm";
+import { getDb } from "@/lib/db/client";
+import { newId } from "@/lib/db/ids";
+import * as schema from "@/lib/db/schema";
+import { publish } from "@/server/events/bus";
+import {
+  getOrCreateContactByIdentity,
+  IG_PREFIX,
+} from "@/server/inbox/identity";
+import {
+  getOrCreateConversation,
+  ingestInboundMessage,
+} from "@/server/inbox/ingest";
 import {
   getInstagramCredentialsByAccountRef,
   getInstagramCredentialsByIgUserId,
@@ -158,14 +169,38 @@ export async function processMetaInstagramPayload(
     }
 
     for (const m of entry.messaging ?? []) {
-      // Los echos son mensajes que el dueno mando desde la app de Instagram.
-      // Fuera del alcance del 014: se ignoran sin ruido.
-      if (m.message?.is_echo) continue;
+      const mid = m.message?.mid;
+      const text = m.message?.text;
+      if (!mid || typeof text !== "string") continue;
+
+      // Echo: mensaje que el dueño envió a mano desde la app de Instagram
+      // o desde Meta Business Suite. Se ingesta como saliente `origin='manual'`,
+      // pausa la IA — mismo patrón que `smb_message_echoes` de WhatsApp.
+      if (m.message?.is_echo) {
+        const recipient = m.recipient?.id;
+        if (!recipient) continue;
+        try {
+          await ingestIgManualEcho({
+            organizationId: creds.organizationId,
+            recipientIgsid: recipient,
+            mid,
+            text,
+            timestamp: m.timestamp,
+          });
+        } catch (err) {
+          console.error(`[ig] error procesando echo ig_${mid}:`, err);
+        }
+        continue;
+      }
 
       const igsid = m.sender?.id;
-      const mid = m.message?.mid;
-      if (!igsid || !mid) continue;
-      if (typeof m.message?.text !== "string") continue; // solo texto (014)
+      if (!igsid) continue;
+
+      // Meta no manda el nombre en el webhook, pero sí lo puedes leer
+      // llamando /{igsid}?fields=name,username con el token de la cuenta.
+      // Si falla (usuario privado, token sin scope, red), queda null y se
+      // muestra el fallback "Contacto de Instagram".
+      const profileName = await resolveIgProfileName(igsid, creds.token);
 
       await ingestInboundMessage({
         organizationId: creds.organizationId,
@@ -174,9 +209,7 @@ export async function processMetaInstagramPayload(
           channel: "instagram",
           phone: null,
           waUserId: null,
-          // Meta no manda nombre ni usuario en el webhook: queda el respaldo
-          // hasta que alguien edite el contacto.
-          profileName: null,
+          profileName,
         },
         waMessageId: `ig_${mid}`,
         type: "text",
@@ -188,4 +221,124 @@ export async function processMetaInstagramPayload(
       });
     }
   }
+}
+
+/**
+ * Consulta el perfil público del que envió el DM. Meta expone `name` y
+ * `username` en `GET /{igsid}?fields=name,username` con el token de la
+ * cuenta, siempre y cuando la ventana de mensajería esté abierta (lo está
+ * porque el usuario acaba de escribir). Prefiere `name`; si no está, usa
+ * `@username`. Cualquier error deja `null` — el ingest sigue igual.
+ */
+async function resolveIgProfileName(
+  igsid: string,
+  token: string
+): Promise<string | null> {
+  const base =
+    process.env.IG_GRAPH_BASE_URL ?? "https://graph.instagram.com";
+  const version = process.env.META_GRAPH_API_VERSION ?? "v25.0";
+  const url = `${base}/${version}/${igsid}?fields=name,username`;
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json().catch(() => null)) as {
+      name?: string;
+      username?: string;
+    } | null;
+    if (json?.name && json.name.trim()) return json.name.trim();
+    if (json?.username && json.username.trim()) return `@${json.username.trim()}`;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Echo de Instagram (o Messenger): mensaje que el dueño envió A MANO
+ * desde la app de Instagram del teléfono o desde Meta Business Suite. Se
+ * registra como saliente `origin='manual'` y pausa la IA — mismo patrón
+ * que `smb_message_echoes` de WhatsApp. Idempotente por `waMessageId`.
+ */
+async function ingestIgManualEcho(input: {
+  organizationId: string;
+  recipientIgsid: string;
+  mid: string;
+  text: string;
+  timestamp?: number;
+}): Promise<void> {
+  const db = getDb();
+  const identity = `${IG_PREFIX}${input.recipientIgsid}`;
+
+  const { contact } = await getOrCreateContactByIdentity(input.organizationId, {
+    identity,
+    channel: "instagram",
+    phone: null,
+    waUserId: null,
+    profileName: null,
+  });
+  const conversation = await getOrCreateConversation(
+    input.organizationId,
+    contact.id,
+    { channel: "instagram" }
+  );
+
+  const waTimestamp = new Date(
+    input.timestamp ? input.timestamp : Date.now()
+  );
+  const waMessageId = `ig_${input.mid}`;
+
+  const inserted = await db
+    .insert(schema.message)
+    .values({
+      id: newId("message"),
+      organizationId: input.organizationId,
+      conversationId: conversation.id,
+      waMessageId,
+      direction: "out",
+      type: "text",
+      text: input.text,
+      status: "sent",
+      origin: "manual",
+      waTimestamp,
+    })
+    .onConflictDoNothing({ target: [schema.message.waMessageId] })
+    .returning();
+  if (!inserted[0]) return; // duplicado
+
+  await db
+    .update(schema.conversation)
+    .set({ lastMessageAt: waTimestamp, updatedAt: new Date() })
+    .where(eq(schema.conversation.id, conversation.id));
+
+  const paused = await db
+    .update(schema.conversation)
+    .set({
+      aiEnabled: false,
+      handoffAt: new Date(),
+      handoffReason: "manual_reply",
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(schema.conversation.id, conversation.id),
+        sql`${schema.conversation.handoffAt} is null`
+      )
+    )
+    .returning();
+  if (paused[0]) {
+    console.log(
+      `[ig] respuesta manual del dueño en ${conversation.id} — IA pausada (manual_reply)`
+    );
+  }
+
+  publish(input.organizationId, {
+    type: "message.new",
+    data: {
+      conversationId: conversation.id,
+      messageId: inserted[0].id,
+    },
+  });
 }

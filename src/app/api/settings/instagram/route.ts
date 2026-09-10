@@ -79,11 +79,16 @@ type Check =
   | { ok: false; status: number; code: string; message: string };
 
 async function verify(data: z.infer<typeof putSchema>): Promise<Check> {
+  // Meta expone DOS ids del mismo perfil en /me:
+  //   - `id` = Instagram-Scoped ID (el que devuelve /me?fields=id, ej. 28978671838402975)
+  //   - `user_id` = App-Scoped ID (el que aparece en `entry.id` de los webhooks, ej. 17841477965412210)
+  // La ingesta busca las credenciales por el ID del webhook, así que validamos
+  // contra `user_id` para que ambas puntas hablen del mismo número.
   const url =
     data.source === "meta"
       ? `${process.env.IG_GRAPH_BASE_URL ?? "https://graph.instagram.com"}/${
           process.env.META_GRAPH_API_VERSION ?? "v25.0"
-        }/me?fields=id,username`
+        }/me?fields=user_id,username`
       : `${process.env.ZERNIO_BASE_URL ?? "https://zernio.com/api/v1"}/inbox/conversations?limit=1`;
 
   let res: Response;
@@ -114,15 +119,15 @@ async function verify(data: z.infer<typeof putSchema>): Promise<Check> {
 
   if (data.source === "meta") {
     const json = (await res.json().catch(() => null)) as {
-      id?: string;
+      user_id?: string;
       username?: string;
     } | null;
-    if (json?.id && json.id !== data.igUserId) {
+    if (json?.user_id && json.user_id !== data.igUserId) {
       return {
         ok: false,
         status: 422,
         code: "id_mismatch",
-        message: `El IG_ID del token es ${json.id}, no ${data.igUserId}`,
+        message: `El IG_ID del token es ${json.user_id}, no ${data.igUserId}`,
       };
     }
     return { ok: true, username: json?.username ?? null };
