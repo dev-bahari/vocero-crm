@@ -1,7 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
-import { getDb } from "@/lib/db/client";
+import { getDb, schema } from "@/lib/db";
 import { newId } from "@/lib/db/ids";
-import * as schema from "@/lib/db/schema";
 import { publish } from "@/server/events/bus";
 import {
   getOrCreateContactByIdentity,
@@ -10,6 +9,7 @@ import {
 import {
   getOrCreateConversation,
   ingestInboundMessage,
+  serializeMessage,
 } from "@/server/inbox/ingest";
 import {
   getInstagramCredentialsByAccountRef,
@@ -213,7 +213,7 @@ export async function processMetaInstagramPayload(
         },
         waMessageId: `ig_${mid}`,
         type: "text",
-        text: m.message.text,
+        text,
         timestamp: String(
           m.timestamp ? Math.floor(m.timestamp / 1000) : Math.floor(Date.now() / 1000)
         ),
@@ -338,7 +338,7 @@ async function ingestIgManualEcho(input: {
     type: "message.new",
     data: {
       conversationId: conversation.id,
-      messageId: inserted[0].id,
+      message: serializeMessage(inserted[0], null),
     },
   });
 }
