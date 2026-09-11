@@ -44,7 +44,7 @@ const BINARY_MEDIA_TYPES = new Set([
   "sticker",
 ] as const);
 
-type MediaInput = {
+export type MediaInput = {
   kind: (typeof schema.mediaAsset.$inferSelect)["kind"];
   waMediaId: string | null;
   mimeType: string | null;
@@ -52,6 +52,13 @@ type MediaInput = {
   caption: string | null;
   payload: unknown;
   fetchStatus: "available" | "pending";
+  /**
+   * 014: canales sin media-id (Instagram con URL efímera de Meta) descargan
+   * el binario ANTES de la ingesta y pasan el path aquí. Con esto ya
+   * disponible, `ensureAssetAvailable` no se dispara.
+   */
+  storagePath?: string | null;
+  fileSize?: number | null;
 };
 
 /**
@@ -126,6 +133,8 @@ async function attachMediaAsset(
         caption: media.caption,
         payload: media.payload ?? null,
         fetchStatus: media.fetchStatus,
+        storagePath: media.storagePath ?? null,
+        fileSize: media.fileSize ?? null,
       })
       .returning();
     const asset = inserted[0];

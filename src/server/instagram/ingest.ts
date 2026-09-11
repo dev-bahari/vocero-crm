@@ -10,11 +10,13 @@ import {
   getOrCreateConversation,
   ingestInboundMessage,
   serializeMessage,
+  type MediaInput,
 } from "@/server/inbox/ingest";
 import {
   getInstagramCredentialsByAccountRef,
   getInstagramCredentialsByIgUserId,
 } from "@/server/instagram/credentials";
+import { saveMediaFile } from "@/server/whatsapp/media";
 import {
   parseZernioEvent,
   zernioSentAtSeconds,
@@ -122,6 +124,11 @@ export async function processZernioEvent(payload: unknown): Promise<void> {
   });
 }
 
+type IgAttachment = {
+  type?: string; // "image" | "video" | "audio" | "file" | "story_mention" | "share" | ...
+  payload?: { url?: string };
+};
+
 type MetaIgPayload = {
   object?: string;
   entry?: Array<{
@@ -135,10 +142,24 @@ type MetaIgPayload = {
         mid?: string;
         text?: string;
         is_echo?: boolean;
+        attachments?: IgAttachment[];
       };
     }>;
   }>;
 };
+
+/**
+ * Tipos de adjunto que Vocero soporta hoy (los que caben en `mediaAsset.kind`).
+ * Los demás (story_mention, share, template) se ignoran con log.
+ */
+const IG_ATTACHMENT_KINDS = {
+  image: "image",
+  video: "video",
+  audio: "audio",
+  file: "document",
+} as const;
+
+type IgSupportedType = keyof typeof IG_ATTACHMENT_KINDS;
 
 export async function processMetaInstagramPayload(
   payload: unknown
@@ -170,8 +191,14 @@ export async function processMetaInstagramPayload(
 
     for (const m of entry.messaging ?? []) {
       const mid = m.message?.mid;
-      const text = m.message?.text;
-      if (!mid || typeof text !== "string") continue;
+      if (!mid) continue;
+      const text = typeof m.message?.text === "string" ? m.message.text : null;
+      const attachment = firstSupportedAttachment(m.message?.attachments);
+
+      // Sin texto y sin adjunto soportado: nada útil para el agente. Log
+      // silencioso para no ruidar el webhook (Meta manda muchos eventos
+      // colaterales — read/typing/postback — que caen aquí).
+      if (text === null && !attachment) continue;
 
       // Echo: mensaje que el dueño envió a mano desde la app de Instagram
       // o desde Meta Business Suite. Se ingesta como saliente `origin='manual'`,
@@ -184,7 +211,7 @@ export async function processMetaInstagramPayload(
             organizationId: creds.organizationId,
             recipientIgsid: recipient,
             mid,
-            text,
+            text: text ?? (attachment ? `[${attachment.kind}]` : ""),
             timestamp: m.timestamp,
           });
         } catch (err) {
@@ -202,6 +229,25 @@ export async function processMetaInstagramPayload(
       // muestra el fallback "Contacto de Instagram".
       const profileName = await resolveIgProfileName(igsid, creds.token);
 
+      // Adjunto: la URL de Meta expira en ~60 s, así que la bajamos aquí
+      // mismo. Fallo de descarga → seguimos SÓLO con el texto (si hay);
+      // sin texto y sin binario, el mensaje se pierde con log — mejor eso
+      // que dejar un `mediaAsset` roto en la BD.
+      let media: MediaInput | null = null;
+      if (attachment) {
+        media = await downloadIgAttachment(
+          creds.organizationId,
+          mid,
+          attachment
+        );
+        if (!media && text === null) {
+          console.warn(
+            `[ig] mensaje ${mid} con adjunto no descargable y sin texto: descartado`
+          );
+          continue;
+        }
+      }
+
       await ingestInboundMessage({
         organizationId: creds.organizationId,
         identity: {
@@ -212,8 +258,9 @@ export async function processMetaInstagramPayload(
           profileName,
         },
         waMessageId: `ig_${mid}`,
-        type: "text",
+        type: media?.kind ?? "text",
         text,
+        media,
         timestamp: String(
           m.timestamp ? Math.floor(m.timestamp / 1000) : Math.floor(Date.now() / 1000)
         ),
@@ -341,4 +388,72 @@ async function ingestIgManualEcho(input: {
       message: serializeMessage(inserted[0], null),
     },
   });
+}
+
+/**
+ * Primer adjunto con tipo soportado (image/video/audio/file). Los tipos
+ * `story_mention`, `share`, `template`, etc. quedan fuera del alcance del
+ * 014 — se registran arriba con log y se ignoran.
+ */
+function firstSupportedAttachment(
+  attachments: IgAttachment[] | undefined
+): { url: string; kind: MediaInput["kind"] } | null {
+  if (!attachments?.length) return null;
+  for (const att of attachments) {
+    const raw = att.type as IgSupportedType | undefined;
+    const url = att.payload?.url;
+    if (!raw || !url) continue;
+    const kind = IG_ATTACHMENT_KINDS[raw];
+    if (!kind) continue;
+    return { url, kind };
+  }
+  return null;
+}
+
+/**
+ * Descarga el binario de un adjunto de Instagram (URL efímera de Meta) y lo
+ * guarda en el volumen persistente. Devuelve un `MediaInput` listo para
+ * `ingestInboundMessage` con `storagePath` preseeded y `fetchStatus="available"`
+ * — con eso `attachMediaAsset` no llama `ensureAssetAvailable` (que sólo sabe
+ * bajar por `waMediaId`, cosa que aquí no tenemos).
+ *
+ * Cualquier error deja `null` — quien llama decide si sigue con solo texto
+ * o descarta el mensaje entero.
+ */
+async function downloadIgAttachment(
+  organizationId: string,
+  mid: string,
+  attachment: { url: string; kind: MediaInput["kind"] }
+): Promise<MediaInput | null> {
+  try {
+    const res = await fetch(attachment.url, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      console.warn(
+        `[ig] descarga adjunto de ${mid} devolvió ${res.status}`
+      );
+      return null;
+    }
+    const mimeType = res.headers.get("content-type")?.split(";")[0]?.trim() ?? null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    // `assetId` lo genera `attachMediaAsset`, pero `saveMediaFile` necesita
+    // uno estable para el path — usamos el `mid` prefijado (único por Meta).
+    const tempAssetId = `ig_${mid.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    const storagePath = await saveMediaFile(organizationId, tempAssetId, buf);
+    return {
+      kind: attachment.kind,
+      waMediaId: null,
+      mimeType,
+      fileName: null,
+      caption: null,
+      payload: { source: "instagram" },
+      fetchStatus: "available",
+      storagePath,
+      fileSize: buf.length,
+    };
+  } catch (err) {
+    console.warn(`[ig] descarga adjunto de ${mid} falló:`, err);
+    return null;
+  }
 }
