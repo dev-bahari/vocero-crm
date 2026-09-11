@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
-import { getDb, schema } from "@/lib/db";
+import { getDb } from "@/lib/db/client";
 import { newId } from "@/lib/db/ids";
+import * as schema from "@/lib/db/schema";
 import { publish } from "@/server/events/bus";
 import {
   getOrCreateContactByIdentity,

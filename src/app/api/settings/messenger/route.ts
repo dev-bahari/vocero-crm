@@ -121,6 +121,17 @@ async function verify(data: VerifyInput): Promise<Check> {
     }
     return { ok: true, pageName: res.name?.trim() || null };
   } catch (err) {
+    // Con el modelo de Casos de Uso reciente, Meta genera tokens de página con
+    // sólo `pages_messaging` (justo lo necesario para el canal). Leer metadata
+    // básica de la página (id/name) exige además `pages_read_engagement`, que
+    // requiere App Review completo para negocios que NO son terceros.
+    // El error `#100` en este contexto indica token válido pero sin permiso
+    // para leer la página — el envío de mensajes sí funciona. Aceptamos el
+    // token y guardamos sin pageName; la bandeja mostrará el pageId como
+    // fallback hasta que el operador ponga un nombre a mano.
+    if (err instanceof MetaApiError && err.status === 400 && err.code === 100) {
+      return { ok: true, pageName: null };
+    }
     return translate(
       err,
       "El token de la página no es válido o no tiene permiso de mensajes (pages_messaging)"

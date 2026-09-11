@@ -42,3 +42,7 @@ Thumbs.db
 .dev-media/
 # Capturas y salidas de los self-tests (p. ej. scripts/e2e-responsive.mjs)
 scratch/
+
+# Local credentials — never commit
+CREDENTIALS_VOCERO.TXT
+*.credentials.txt
